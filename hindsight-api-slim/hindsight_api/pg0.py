@@ -116,10 +116,36 @@ class EmbeddedPostgres:
             return False
 
     async def ensure_running(self) -> str:
-        """Ensure the PostgreSQL server is running, starting it if needed."""
-        if await self.is_running():
-            return await self.get_uri()
-        return await self.start()
+        """Ensure the PostgreSQL server is running, starting it if needed.
+
+        Concurrent calls for the same ``name`` are serialized: the first
+        caller starts pg0, subsequent callers see it running and reuse it.
+
+        Without this lock, two callers racing into the start path (e.g. the
+        ``multi_bank`` and ``single_bank`` Starlette lifespans both calling
+        ``MemoryEngine.initialize()`` on app startup) collide on pg0's
+        filesystem lockfile — the second caller's ``is_running()`` check
+        returns False while the first is mid-spawn, then its ``start()``
+        fails with ``Error: Instance already running (pid: <N>)`` (or, on a
+        different timing slice, ``ConnectionRefusedError`` against
+        localhost:5432). The container exits, Compose's healthcheck times
+        out, and any orchestrator using ``depends_on: service_healthy``
+        refuses to start dependents. Observed in production after the
+        ``ApiKeySchemaTenantExtension`` activated the chained-lifespan path.
+        """
+        async with _ensure_running_locks.setdefault(self.name, asyncio.Lock()):
+            if await self.is_running():
+                return await self.get_uri()
+            return await self.start()
+
+
+# Module-level lock keyed by instance name. All EmbeddedPostgres instances
+# sharing a ``name`` (the default ``"hindsight"`` is used by both the
+# multi_bank and single_bank MemoryEngines in api/__init__.py) collide on
+# the same pg0 filesystem lockfile and must be serialized at the Python
+# layer. setdefault() keeps the dict initialisation lock-free for the
+# common case.
+_ensure_running_locks: dict[str, asyncio.Lock] = {}
 
 
 _default_instance: EmbeddedPostgres | None = None
